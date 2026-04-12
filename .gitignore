@@ -1,0 +1,36 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.old
+flasher_args.json
+partition_table/
+managed_components/
+dependencies.lock
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+
+# VS Code / JetBrains
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / temporary
+*.log
+*.tmp

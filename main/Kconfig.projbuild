@@ -1,0 +1,27 @@
+menu "MQTT Configuration"
+
+    config APP_MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default ""
+        help
+            Full MQTT broker URI, including scheme and port.
+
+    config APP_MQTT_USERNAME
+        string "MQTT username"
+        default ""
+        help
+            Username for MQTT broker authentication.
+
+    config APP_MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+        help
+            Password for MQTT broker authentication.
+
+    config APP_MQTT_TOPIC
+        string "MQTT publish topic"
+        default "if4051/13522091/test"
+        help
+            Topic used by the ESP32 to publish messages.
+
+endmenu
