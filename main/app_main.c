@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -14,7 +15,46 @@
 #include "esp_crt_bundle.h"
 #include "mqtt_client.h"
 
-static const char *TAG = "mqtt_minimal";
+static const char *TAG = "mqtt_image";
+
+extern const uint8_t test_image_jpg_start[] asm("_binary_test_image_jpg_start");
+extern const uint8_t test_image_jpg_end[]   asm("_binary_test_image_jpg_end");
+
+static void publish_image(esp_mqtt_client_handle_t client)
+{
+    const uint8_t *image_data = test_image_jpg_start;
+    size_t image_size = test_image_jpg_end - test_image_jpg_start;
+
+    int64_t ts_us = esp_timer_get_time();
+
+    char meta_payload[256];
+    snprintf(meta_payload, sizeof(meta_payload),
+             "{\"timestamp_us\":%" PRId64 ",\"filename\":\"test-image.jpg\",\"size\":%u}",
+             ts_us, (unsigned int)image_size);
+
+    int meta_msg_id = esp_mqtt_client_publish(
+        client,
+        "if4051/13522091/image/meta",
+        meta_payload,
+        0,
+        1,
+        0
+    );
+
+    ESP_LOGI(TAG, "Published metadata, msg_id=%d", meta_msg_id);
+    ESP_LOGI(TAG, "Image size = %u bytes", (unsigned int)image_size);
+
+    int img_msg_id = esp_mqtt_client_publish(
+        client,
+        "if4051/13522091/image/raw",
+        (const char *)image_data,
+        (int)image_size,
+        1,
+        0
+    );
+
+    ESP_LOGI(TAG, "Published image, msg_id=%d", img_msg_id);
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -24,15 +64,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT connected");
-
-            esp_mqtt_client_publish(
-                client,
-                CONFIG_APP_MQTT_TOPIC,
-                "ESP32 connected to HiveMQ Cloud",
-                0,
-                1,
-                0
-            );
+            publish_image(client);
             break;
 
         case MQTT_EVENT_DISCONNECTED:

@@ -20,7 +20,7 @@ menu "MQTT Configuration"
 
     config APP_MQTT_TOPIC
         string "MQTT publish topic"
-        default "if4051/13522091/test"
+        default "test"
         help
             Topic used by the ESP32 to publish messages.
 
