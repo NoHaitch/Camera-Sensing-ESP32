@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdbool.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -20,41 +24,68 @@ static const char *TAG = "mqtt_image";
 extern const uint8_t test_image_jpg_start[] asm("_binary_test_image_jpg_start");
 extern const uint8_t test_image_jpg_end[]   asm("_binary_test_image_jpg_end");
 
+static esp_mqtt_client_handle_t g_client = NULL;
+static bool g_mqtt_connected = false;
+static bool g_publish_task_started = false;
+
 static int g_meta_msg_id = -1;
 static int g_raw_msg_id = -1;
-
 static int64_t g_meta_publish_start_us = 0;
 static int64_t g_raw_publish_start_us = 0;
+
+static const int T_SECONDS = 2;   // NIM 13522091 -> mod(91,10)+1 = 2
+static const int N_SEND    = 10;  // ubah ke 20 lalu 100 saat pengujian
 
 static void print_separator(void)
 {
     ESP_LOGI(TAG, "============================================================");
 }
 
-static void publish_image(esp_mqtt_client_handle_t client)
+static void build_topic(char *buffer, size_t buffer_size, const char *suffix)
+{
+    snprintf(buffer, buffer_size, "%s/%s", CONFIG_APP_MQTT_TOPIC, suffix);
+}
+
+static void publish_image_once(esp_mqtt_client_handle_t client, int seq, int64_t prev_start_us)
 {
     const uint8_t *image_data = test_image_jpg_start;
-    size_t image_size = test_image_jpg_end - test_image_jpg_start;
+    size_t image_size_bytes = test_image_jpg_end - test_image_jpg_start;
+
+    char meta_topic[128];
+    char raw_topic[128];
+    build_topic(meta_topic, sizeof(meta_topic), "meta");
+    build_topic(raw_topic, sizeof(raw_topic), "raw");
 
     int64_t ts_send_us = esp_timer_get_time();
 
     char meta_payload[256];
     snprintf(meta_payload, sizeof(meta_payload),
-             "{\"timestamp_us\":%" PRId64 ",\"filename\":\"test-image.jpg\",\"size\":%u}",
-             ts_send_us, (unsigned int)image_size);
+             "{\"seq\":%d,\"timestamp_us\":%" PRId64 ",\"filename\":\"test-image.jpg\",\"size_bytes\":%u}",
+             seq, ts_send_us, (unsigned int)image_size_bytes);
 
     print_separator();
-    ESP_LOGI(TAG, "START IMAGE PUBLISH");
-    ESP_LOGI(TAG, "timestamp_us        : %" PRId64, ts_send_us);
-    ESP_LOGI(TAG, "filename            : test-image.jpg");
-    ESP_LOGI(TAG, "image_size_bytes    : %u", (unsigned int)image_size);
-    ESP_LOGI(TAG, "meta_topic          : if4051/13522091/image/meta");
-    ESP_LOGI(TAG, "raw_topic           : if4051/13522091/image/raw");
+    ESP_LOGI(TAG, "SEND #%d / %d", seq, N_SEND);
+    ESP_LOGI(TAG, "target_interval_s        : %d s", T_SECONDS);
+    ESP_LOGI(TAG, "timestamp_send_us        : %" PRId64 " us", ts_send_us);
+    ESP_LOGI(TAG, "timestamp_send_ms        : %.3f ms", ts_send_us / 1000.0);
+
+    if (prev_start_us > 0) {
+        int64_t actual_interval_us = ts_send_us - prev_start_us;
+        ESP_LOGI(TAG, "actual_interval_us      : %" PRId64 " us", actual_interval_us);
+        ESP_LOGI(TAG, "actual_interval_ms      : %.3f ms", actual_interval_us / 1000.0);
+        ESP_LOGI(TAG, "actual_interval_s       : %.3f s", actual_interval_us / 1000000.0);
+    } else {
+        ESP_LOGI(TAG, "actual_interval         : N/A (first send)");
+    }
+
+    ESP_LOGI(TAG, "image_size_bytes        : %u bytes", (unsigned int)image_size_bytes);
+    ESP_LOGI(TAG, "meta_topic              : %s", meta_topic);
+    ESP_LOGI(TAG, "raw_topic               : %s", raw_topic);
 
     g_meta_publish_start_us = esp_timer_get_time();
     g_meta_msg_id = esp_mqtt_client_publish(
         client,
-        "if4051/13522091/image/meta",
+        meta_topic,
         meta_payload,
         0,
         1,
@@ -63,27 +94,61 @@ static void publish_image(esp_mqtt_client_handle_t client)
     int64_t meta_publish_end_us = esp_timer_get_time();
 
     ESP_LOGI(TAG, "META publish()");
-    ESP_LOGI(TAG, "msg_id              : %d", g_meta_msg_id);
-    ESP_LOGI(TAG, "payload_size_bytes  : %u", (unsigned int)strlen(meta_payload));
-    ESP_LOGI(TAG, "call_duration_us    : %" PRId64, meta_publish_end_us - g_meta_publish_start_us);
+    ESP_LOGI(TAG, "meta_msg_id             : %d", g_meta_msg_id);
+    ESP_LOGI(TAG, "meta_payload_size_bytes : %u bytes", (unsigned int)strlen(meta_payload));
+    ESP_LOGI(TAG, "meta_call_duration_us   : %" PRId64 " us", meta_publish_end_us - g_meta_publish_start_us);
+    ESP_LOGI(TAG, "meta_call_duration_ms   : %.3f ms", (meta_publish_end_us - g_meta_publish_start_us) / 1000.0);
 
     g_raw_publish_start_us = esp_timer_get_time();
     g_raw_msg_id = esp_mqtt_client_publish(
         client,
-        "if4051/13522091/image/raw",
+        raw_topic,
         (const char *)image_data,
-        (int)image_size,
+        (int)image_size_bytes,
         1,
         0
     );
     int64_t raw_publish_end_us = esp_timer_get_time();
 
     ESP_LOGI(TAG, "RAW IMAGE publish()");
-    ESP_LOGI(TAG, "msg_id              : %d", g_raw_msg_id);
-    ESP_LOGI(TAG, "payload_size_bytes  : %u", (unsigned int)image_size);
-    ESP_LOGI(TAG, "call_duration_us    : %" PRId64, raw_publish_end_us - g_raw_publish_start_us);
-    ESP_LOGI(TAG, "NOTE                : ack latency appears when MQTT_EVENT_PUBLISHED arrives");
+    ESP_LOGI(TAG, "raw_msg_id              : %d", g_raw_msg_id);
+    ESP_LOGI(TAG, "raw_payload_size_bytes  : %u bytes", (unsigned int)image_size_bytes);
+    ESP_LOGI(TAG, "raw_call_duration_us    : %" PRId64 " us", raw_publish_end_us - g_raw_publish_start_us);
+    ESP_LOGI(TAG, "raw_call_duration_ms    : %.3f ms", (raw_publish_end_us - g_raw_publish_start_us) / 1000.0);
+    ESP_LOGI(TAG, "total_send_call_us      : %" PRId64 " us", raw_publish_end_us - ts_send_us);
+    ESP_LOGI(TAG, "total_send_call_ms      : %.3f ms", (raw_publish_end_us - ts_send_us) / 1000.0);
+    ESP_LOGI(TAG, "note                    : broker ack latency appears at MQTT_EVENT_PUBLISHED");
     print_separator();
+}
+
+static void image_publish_task(void *pvParameters)
+{
+    int64_t prev_start_us = 0;
+
+    ESP_LOGI(TAG, "Publisher task started");
+    ESP_LOGI(TAG, "configured_base_topic   : %s", CONFIG_APP_MQTT_TOPIC);
+    ESP_LOGI(TAG, "configured_interval_s   : %d s", T_SECONDS);
+    ESP_LOGI(TAG, "configured_send_count   : %d", N_SEND);
+
+    for (int seq = 1; seq <= N_SEND; seq++) {
+        if (!g_mqtt_connected) {
+            ESP_LOGW(TAG, "MQTT disconnected, stopping publisher task");
+            break;
+        }
+
+        int64_t loop_start_us = esp_timer_get_time();
+        publish_image_once(g_client, seq, prev_start_us);
+        prev_start_us = loop_start_us;
+
+        if (seq < N_SEND) {
+            ESP_LOGI(TAG, "wait_before_next_send  : %d s", T_SECONDS);
+            vTaskDelay(pdMS_TO_TICKS(T_SECONDS * 1000));
+        }
+    }
+
+    ESP_LOGI(TAG, "Publisher task finished");
+    g_publish_task_started = false;
+    vTaskDelete(NULL);
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -94,11 +159,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT connected");
-            publish_image(client);
+            g_client = client;
+            g_mqtt_connected = true;
+
+            if (!g_publish_task_started) {
+                g_publish_task_started = true;
+                xTaskCreate(image_publish_task, "image_publish_task", 8192, NULL, 5, NULL);
+            }
             break;
 
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT disconnected");
+            g_mqtt_connected = false;
             break;
 
         case MQTT_EVENT_PUBLISHED: {
@@ -106,20 +178,27 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
             print_separator();
             ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED");
-            ESP_LOGI(TAG, "ack_msg_id          : %d", event->msg_id);
+            ESP_LOGI(TAG, "ack_msg_id              : %d", event->msg_id);
 
             if (event->msg_id == g_meta_msg_id) {
-                ESP_LOGI(TAG, "type                : metadata");
-                ESP_LOGI(TAG, "ack_latency_us      : %" PRId64, now_us - g_meta_publish_start_us);
+                int64_t ack_latency_us = now_us - g_meta_publish_start_us;
+                ESP_LOGI(TAG, "ack_type                : metadata");
+                ESP_LOGI(TAG, "ack_latency_us          : %" PRId64 " us", ack_latency_us);
+                ESP_LOGI(TAG, "ack_latency_ms          : %.3f ms", ack_latency_us / 1000.0);
+                ESP_LOGI(TAG, "ack_latency_s           : %.3f s", ack_latency_us / 1000000.0);
             } else if (event->msg_id == g_raw_msg_id) {
-                ESP_LOGI(TAG, "type                : raw_image");
-                ESP_LOGI(TAG, "ack_latency_us      : %" PRId64, now_us - g_raw_publish_start_us);
+                int64_t ack_latency_us = now_us - g_raw_publish_start_us;
+                ESP_LOGI(TAG, "ack_type                : raw_image");
+                ESP_LOGI(TAG, "ack_latency_us          : %" PRId64 " us", ack_latency_us);
+                ESP_LOGI(TAG, "ack_latency_ms          : %.3f ms", ack_latency_us / 1000.0);
+                ESP_LOGI(TAG, "ack_latency_s           : %.3f s", ack_latency_us / 1000000.0);
             } else {
-                ESP_LOGI(TAG, "type                : unknown");
-                ESP_LOGI(TAG, "ack_latency_us      : N/A");
+                ESP_LOGI(TAG, "ack_type                : unknown");
+                ESP_LOGI(TAG, "ack_latency             : N/A");
             }
 
-            ESP_LOGI(TAG, "ack_timestamp_us    : %" PRId64, now_us);
+            ESP_LOGI(TAG, "ack_timestamp_us        : %" PRId64 " us", now_us);
+            ESP_LOGI(TAG, "ack_timestamp_ms        : %.3f ms", now_us / 1000.0);
             print_separator();
             break;
         }
@@ -128,9 +207,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGE(TAG, "MQTT error");
             if (event->error_handle &&
                 event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-                ESP_LOGE(TAG, "esp-tls err=0x%x", event->error_handle->esp_tls_last_esp_err);
-                ESP_LOGE(TAG, "tls stack err=0x%x", event->error_handle->esp_tls_stack_err);
-                ESP_LOGE(TAG, "sock errno=%d (%s)",
+                ESP_LOGE(TAG, "esp_tls_error_code      : 0x%x", event->error_handle->esp_tls_last_esp_err);
+                ESP_LOGE(TAG, "tls_stack_error_code    : 0x%x", event->error_handle->esp_tls_stack_err);
+                ESP_LOGE(TAG, "socket_errno            : %d (%s)",
                          event->error_handle->esp_transport_sock_errno,
                          strerror(event->error_handle->esp_transport_sock_errno));
             }
@@ -162,8 +241,8 @@ static void mqtt_app_start(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting app");
-    ESP_LOGI(TAG, "Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
+    ESP_LOGI(TAG, "free_heap_bytes         : %" PRIu32 " bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "esp_idf_version         : %s", esp_get_idf_version());
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
