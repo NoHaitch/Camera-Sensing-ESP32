@@ -29,15 +29,12 @@ static bool g_mqtt_connected = false;
 static bool g_publish_task_started = false;
 
 static const int T_SECONDS = 2;   // NIM 13522091 -> mod(91,10)+1 = 2
-static const int N_SEND    = 10;  // experiment: 10/20/50 
+static const int N_SEND    = 10;  // experimen: 10/20/50
 
 #define MAX_SAMPLES 100
 
 static int g_meta_msg_id[MAX_SAMPLES];
 static int g_raw_msg_id[MAX_SAMPLES];
-
-static int64_t g_send_start_us[MAX_SAMPLES];
-static int64_t g_send_interval_us[MAX_SAMPLES];
 
 static int64_t g_meta_publish_start_us[MAX_SAMPLES];
 static int64_t g_meta_call_duration_us[MAX_SAMPLES];
@@ -50,7 +47,7 @@ static int64_t g_raw_ack_latency_us[MAX_SAMPLES];
 static bool g_meta_ack_received[MAX_SAMPLES];
 static bool g_raw_ack_received[MAX_SAMPLES];
 
-static void print_separator(void) 
+static void print_separator(void)
 {
     ESP_LOGI(TAG, "============================================================");
 }
@@ -60,8 +57,8 @@ static void build_topic(char *buffer, size_t buffer_size, const char *suffix)
     snprintf(buffer, buffer_size, "%s/%s", CONFIG_APP_MQTT_TOPIC, suffix);
 }
 
-static void stats_int64(const int64_t *arr, const bool *valid, int n,
-                        int64_t *min_v, int64_t *max_v, double *avg_v, int *count_v)
+static void stats_int64_to_ms(const int64_t *arr, const bool *valid, int n,
+                              double *min_ms, double *max_ms, double *avg_ms, int *count_v)
 {
     int count = 0;
     int64_t min_val = 0;
@@ -74,6 +71,7 @@ static void stats_int64(const int64_t *arr, const bool *valid, int n,
         }
 
         int64_t v = arr[i];
+
         if (count == 0) {
             min_val = v;
             max_val = v;
@@ -87,83 +85,103 @@ static void stats_int64(const int64_t *arr, const bool *valid, int n,
     }
 
     *count_v = count;
+
     if (count == 0) {
-        *min_v = 0;
-        *max_v = 0;
-        *avg_v = 0.0;
+        *min_ms = 0.0;
+        *max_ms = 0.0;
+        *avg_ms = 0.0;
     } else {
-        *min_v = min_val;
-        *max_v = max_val;
-        *avg_v = sum / count;
+        *min_ms = min_val / 1000.0;
+        *max_ms = max_val / 1000.0;
+        *avg_ms = (sum / count) / 1000.0;
     }
 }
 
-static void print_stats_block(const char *title, const int64_t *arr, const bool *valid, int n)
+static void print_stats_block_ms(const char *title, const int64_t *arr, const bool *valid, int n)
 {
-    int64_t min_v, max_v;
-    double avg_v;
+    double min_ms, max_ms, avg_ms;
     int count_v;
 
-    stats_int64(arr, valid, n, &min_v, &max_v, &avg_v, &count_v);
+    stats_int64_to_ms(arr, valid, n, &min_ms, &max_ms, &avg_ms, &count_v);
 
     ESP_LOGI(TAG, "%s", title);
-    ESP_LOGI(TAG, "  sample_count        : %d", count_v);
+    ESP_LOGI(TAG, "  count  : %d", count_v);
 
     if (count_v == 0) {
-        ESP_LOGI(TAG, "  min                 : N/A");
-        ESP_LOGI(TAG, "  max                 : N/A");
-        ESP_LOGI(TAG, "  avg                 : N/A");
+        ESP_LOGI(TAG, "  min_ms : N/A");
+        ESP_LOGI(TAG, "  max_ms : N/A");
+        ESP_LOGI(TAG, "  avg_ms : N/A");
         return;
     }
 
-    ESP_LOGI(TAG, "  min_us              : %" PRId64 " us", min_v);
-    ESP_LOGI(TAG, "  min_ms              : %.3f ms", min_v / 1000.0);
-    ESP_LOGI(TAG, "  max_us              : %" PRId64 " us", max_v);
-    ESP_LOGI(TAG, "  max_ms              : %.3f ms", max_v / 1000.0);
-    ESP_LOGI(TAG, "  avg_us              : %.3f us", avg_v);
-    ESP_LOGI(TAG, "  avg_ms              : %.3f ms", avg_v / 1000.0);
+    ESP_LOGI(TAG, "  min_ms : %.3f", min_ms);
+    ESP_LOGI(TAG, "  max_ms : %.3f", max_ms);
+    ESP_LOGI(TAG, "  avg_ms : %.3f", avg_ms);
+}
+
+static void print_array_ms(const char *title, const int64_t *arr, const bool *valid, int n)
+{
+    char line[2048];
+    int offset = 0;
+
+    offset += snprintf(line + offset, sizeof(line) - offset, "%s [", title);
+
+    bool first = true;
+    for (int i = 0; i < n; i++) {
+        if (valid != NULL && !valid[i]) {
+            continue;
+        }
+
+        double value_ms = arr[i] / 1000.0;
+
+        if (!first) {
+            offset += snprintf(line + offset, sizeof(line) - offset, ", ");
+        }
+
+        offset += snprintf(line + offset, sizeof(line) - offset, "%.3f", value_ms);
+        first = false;
+
+        if (offset >= (int)sizeof(line) - 32) {
+            break;
+        }
+    }
+
+    snprintf(line + offset, sizeof(line) - offset, "]");
+    ESP_LOGI(TAG, "%s", line);
 }
 
 static void print_experiment_summary(size_t image_size_bytes)
 {
-    bool interval_valid[MAX_SAMPLES] = {0};
-
-    for (int i = 0; i < N_SEND; i++) {
-        interval_valid[i] = (i > 0);
-    }
-
     print_separator();
-    ESP_LOGI(TAG, "FINAL EXPERIMENT SUMMARY");
+    ESP_LOGI(TAG, "FINAL SUMMARY");
     print_separator();
 
-    ESP_LOGI(TAG, "CONFIGURATION");
-    ESP_LOGI(TAG, "  base_topic          : %s", CONFIG_APP_MQTT_TOPIC);
-    ESP_LOGI(TAG, "  interval_target_s   : %d s", T_SECONDS);
-    ESP_LOGI(TAG, "  total_send_count    : %d", N_SEND);
-    ESP_LOGI(TAG, "  image_size_bytes    : %u bytes", (unsigned int)image_size_bytes);
+    ESP_LOGI(TAG, "topic            : %s", CONFIG_APP_MQTT_TOPIC);
+    ESP_LOGI(TAG, "target_interval  : %d s", T_SECONDS);
+    ESP_LOGI(TAG, "send_count       : %d", N_SEND);
+    ESP_LOGI(TAG, "image_size_bytes : %u", (unsigned int)image_size_bytes);
 
     print_separator();
-    print_stats_block("INTERVAL SUMMARY (actual send start interval)", g_send_interval_us, interval_valid, N_SEND);
+    ESP_LOGI(TAG, "RAW DATA ARRAYS (ms)");
+    print_array_ms("meta_call_ms", g_meta_call_duration_us, NULL,                N_SEND);
+    print_array_ms("meta_ack_ms",  g_meta_ack_latency_us,   g_meta_ack_received, N_SEND);
+    print_array_ms("raw_call_ms",  g_raw_call_duration_us,  NULL,                N_SEND);
+    print_array_ms("raw_ack_ms",   g_raw_ack_latency_us,    g_raw_ack_received,  N_SEND);
 
     print_separator();
-    ESP_LOGI(TAG, "META SUMMARY");
-    print_stats_block("META publish call duration", g_meta_call_duration_us, NULL, N_SEND);
-    print_stats_block("META broker ack latency", g_meta_ack_latency_us, g_meta_ack_received, N_SEND);
+    ESP_LOGI(TAG, "META");
+    print_stats_block_ms("call_duration", g_meta_call_duration_us, NULL,                N_SEND);
+    print_stats_block_ms("ack_latency",   g_meta_ack_latency_us,   g_meta_ack_received, N_SEND);
 
     print_separator();
-    ESP_LOGI(TAG, "RAW SUMMARY");
-    print_stats_block("RAW publish call duration", g_raw_call_duration_us, NULL, N_SEND);
-    print_stats_block("RAW broker ack latency", g_raw_ack_latency_us, g_raw_ack_received, N_SEND);
+    ESP_LOGI(TAG, "RAW");
+    print_stats_block_ms("call_duration", g_raw_call_duration_us, NULL,               N_SEND);
+    print_stats_block_ms("ack_latency",   g_raw_ack_latency_us,   g_raw_ack_received, N_SEND);
 
-    print_separator();
-    ESP_LOGI(TAG, "NOTE");
-    ESP_LOGI(TAG, "  - Interval summary di atas adalah interval antar awal pengiriman di sisi ESP32.");
-    ESP_LOGI(TAG, "  - Ack latency adalah waktu sampai broker mengirim MQTT_EVENT_PUBLISHED.");
-    ESP_LOGI(TAG, "  - End-to-end latency resmi tugas tetap harus dihitung di sisi subscriber/user.");
     print_separator();
 }
 
-static void publish_image_once(esp_mqtt_client_handle_t client, int seq, int64_t prev_start_us)
+static void publish_image_once(esp_mqtt_client_handle_t client, int seq)
 {
     const uint8_t *image_data = test_image_jpg_start;
     size_t image_size_bytes = test_image_jpg_end - test_image_jpg_start;
@@ -174,33 +192,14 @@ static void publish_image_once(esp_mqtt_client_handle_t client, int seq, int64_t
     build_topic(raw_topic, sizeof(raw_topic), "raw");
 
     int idx = seq - 1;
-
     int64_t ts_send_us = esp_timer_get_time();
-    g_send_start_us[idx] = ts_send_us;
-    g_send_interval_us[idx] = (idx == 0) ? 0 : (ts_send_us - prev_start_us);
 
     char meta_payload[256];
     snprintf(meta_payload, sizeof(meta_payload),
              "{\"seq\":%d,\"timestamp_us\":%" PRId64 ",\"filename\":\"test-image.jpg\",\"size_bytes\":%u}",
              seq, ts_send_us, (unsigned int)image_size_bytes);
 
-    print_separator();
     ESP_LOGI(TAG, "SEND #%d / %d", seq, N_SEND);
-    ESP_LOGI(TAG, "target_interval_s        : %d s", T_SECONDS);
-    ESP_LOGI(TAG, "timestamp_send_us        : %" PRId64 " us", ts_send_us);
-    ESP_LOGI(TAG, "timestamp_send_ms        : %.3f ms", ts_send_us / 1000.0);
-
-    if (idx == 0) {
-        ESP_LOGI(TAG, "actual_interval          : N/A (first send)");
-    } else {
-        ESP_LOGI(TAG, "actual_interval_us       : %" PRId64 " us", g_send_interval_us[idx]);
-        ESP_LOGI(TAG, "actual_interval_ms       : %.3f ms", g_send_interval_us[idx] / 1000.0);
-        ESP_LOGI(TAG, "actual_interval_s        : %.3f s", g_send_interval_us[idx] / 1000000.0);
-    }
-
-    ESP_LOGI(TAG, "image_size_bytes         : %u bytes", (unsigned int)image_size_bytes);
-    ESP_LOGI(TAG, "meta_topic               : %s", meta_topic);
-    ESP_LOGI(TAG, "raw_topic                : %s", raw_topic);
 
     g_meta_ack_received[idx] = false;
     g_raw_ack_received[idx] = false;
@@ -217,12 +216,6 @@ static void publish_image_once(esp_mqtt_client_handle_t client, int seq, int64_t
     int64_t meta_publish_end_us = esp_timer_get_time();
     g_meta_call_duration_us[idx] = meta_publish_end_us - g_meta_publish_start_us[idx];
 
-    ESP_LOGI(TAG, "META publish()");
-    ESP_LOGI(TAG, "meta_msg_id              : %d", g_meta_msg_id[idx]);
-    ESP_LOGI(TAG, "meta_payload_size_bytes  : %u bytes", (unsigned int)strlen(meta_payload));
-    ESP_LOGI(TAG, "meta_call_duration_us    : %" PRId64 " us", g_meta_call_duration_us[idx]);
-    ESP_LOGI(TAG, "meta_call_duration_ms    : %.3f ms", g_meta_call_duration_us[idx] / 1000.0);
-
     g_raw_publish_start_us[idx] = esp_timer_get_time();
     g_raw_msg_id[idx] = esp_mqtt_client_publish(
         client,
@@ -234,26 +227,14 @@ static void publish_image_once(esp_mqtt_client_handle_t client, int seq, int64_t
     );
     int64_t raw_publish_end_us = esp_timer_get_time();
     g_raw_call_duration_us[idx] = raw_publish_end_us - g_raw_publish_start_us[idx];
-
-    ESP_LOGI(TAG, "RAW IMAGE publish()");
-    ESP_LOGI(TAG, "raw_msg_id               : %d", g_raw_msg_id[idx]);
-    ESP_LOGI(TAG, "raw_payload_size_bytes   : %u bytes", (unsigned int)image_size_bytes);
-    ESP_LOGI(TAG, "raw_call_duration_us     : %" PRId64 " us", g_raw_call_duration_us[idx]);
-    ESP_LOGI(TAG, "raw_call_duration_ms     : %.3f ms", g_raw_call_duration_us[idx] / 1000.0);
-    ESP_LOGI(TAG, "total_send_call_us       : %" PRId64 " us", raw_publish_end_us - ts_send_us);
-    ESP_LOGI(TAG, "total_send_call_ms       : %.3f ms", (raw_publish_end_us - ts_send_us) / 1000.0);
-    print_separator();
 }
 
 static void image_publish_task(void *pvParameters)
 {
-    int64_t prev_start_us = 0;
     size_t image_size_bytes = test_image_jpg_end - test_image_jpg_start;
 
     memset(g_meta_msg_id, 0, sizeof(g_meta_msg_id));
     memset(g_raw_msg_id, 0, sizeof(g_raw_msg_id));
-    memset(g_send_start_us, 0, sizeof(g_send_start_us));
-    memset(g_send_interval_us, 0, sizeof(g_send_interval_us));
     memset(g_meta_publish_start_us, 0, sizeof(g_meta_publish_start_us));
     memset(g_meta_call_duration_us, 0, sizeof(g_meta_call_duration_us));
     memset(g_meta_ack_latency_us, 0, sizeof(g_meta_ack_latency_us));
@@ -263,23 +244,14 @@ static void image_publish_task(void *pvParameters)
     memset(g_meta_ack_received, 0, sizeof(g_meta_ack_received));
     memset(g_raw_ack_received, 0, sizeof(g_raw_ack_received));
 
-    ESP_LOGI(TAG, "Publisher task started");
-    ESP_LOGI(TAG, "configured_base_topic    : %s", CONFIG_APP_MQTT_TOPIC);
-    ESP_LOGI(TAG, "configured_interval_s    : %d s", T_SECONDS);
-    ESP_LOGI(TAG, "configured_send_count    : %d", N_SEND);
-
     for (int seq = 1; seq <= N_SEND; seq++) {
         if (!g_mqtt_connected) {
-            ESP_LOGW(TAG, "MQTT disconnected, stopping publisher task");
             break;
         }
 
-        int64_t loop_start_us = esp_timer_get_time();
-        publish_image_once(g_client, seq, prev_start_us);
-        prev_start_us = loop_start_us;
+        publish_image_once(g_client, seq);
 
         if (seq < N_SEND) {
-            ESP_LOGI(TAG, "wait_before_next_send   : %d s", T_SECONDS);
             vTaskDelay(pdMS_TO_TICKS(T_SECONDS * 1000));
         }
     }
@@ -288,7 +260,6 @@ static void image_publish_task(void *pvParameters)
 
     print_experiment_summary(image_size_bytes);
 
-    ESP_LOGI(TAG, "Publisher task finished");
     g_publish_task_started = false;
     vTaskDelete(NULL);
 }
@@ -300,7 +271,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "MQTT connected");
             g_client = client;
             g_mqtt_connected = true;
 
@@ -311,63 +281,34 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             break;
 
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "MQTT disconnected");
             g_mqtt_connected = false;
             break;
 
         case MQTT_EVENT_PUBLISHED: {
             int64_t now_us = esp_timer_get_time();
-            bool found = false;
 
             for (int i = 0; i < N_SEND; i++) {
                 if (event->msg_id == g_meta_msg_id[i]) {
                     g_meta_ack_latency_us[i] = now_us - g_meta_publish_start_us[i];
                     g_meta_ack_received[i] = true;
-
-                    print_separator();
-                    ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED");
-                    ESP_LOGI(TAG, "ack_type                : metadata");
-                    ESP_LOGI(TAG, "send_index              : %d", i + 1);
-                    ESP_LOGI(TAG, "ack_msg_id              : %d", event->msg_id);
-                    ESP_LOGI(TAG, "ack_latency_us          : %" PRId64 " us", g_meta_ack_latency_us[i]);
-                    ESP_LOGI(TAG, "ack_latency_ms          : %.3f ms", g_meta_ack_latency_us[i] / 1000.0);
-                    print_separator();
-
-                    found = true;
                     break;
                 }
 
                 if (event->msg_id == g_raw_msg_id[i]) {
                     g_raw_ack_latency_us[i] = now_us - g_raw_publish_start_us[i];
                     g_raw_ack_received[i] = true;
-
-                    print_separator();
-                    ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED");
-                    ESP_LOGI(TAG, "ack_type                : raw_image");
-                    ESP_LOGI(TAG, "send_index              : %d", i + 1);
-                    ESP_LOGI(TAG, "ack_msg_id              : %d", event->msg_id);
-                    ESP_LOGI(TAG, "ack_latency_us          : %" PRId64 " us", g_raw_ack_latency_us[i]);
-                    ESP_LOGI(TAG, "ack_latency_ms          : %.3f ms", g_raw_ack_latency_us[i] / 1000.0);
-                    print_separator();
-
-                    found = true;
                     break;
                 }
-            }
-
-            if (!found) {
-                ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED unknown msg_id=%d", event->msg_id);
             }
             break;
         }
 
         case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "MQTT error");
             if (event->error_handle &&
                 event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-                ESP_LOGE(TAG, "esp_tls_error_code      : 0x%x", event->error_handle->esp_tls_last_esp_err);
-                ESP_LOGE(TAG, "tls_stack_error_code    : 0x%x", event->error_handle->esp_tls_stack_err);
-                ESP_LOGE(TAG, "socket_errno            : %d (%s)",
+                ESP_LOGE(TAG, "esp_tls_error_code : 0x%x", event->error_handle->esp_tls_last_esp_err);
+                ESP_LOGE(TAG, "tls_stack_error_code : 0x%x", event->error_handle->esp_tls_stack_err);
+                ESP_LOGE(TAG, "socket_errno : %d (%s)",
                          event->error_handle->esp_transport_sock_errno,
                          strerror(event->error_handle->esp_transport_sock_errno));
             }
