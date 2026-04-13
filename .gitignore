@@ -34,3 +34,9 @@ __pycache__/
 # Logs / temporary
 *.log
 *.tmp
+
+# cred
+mqttcred
+
+# python receiver
+.venv
