@@ -2,6 +2,8 @@
 #include <string.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +21,8 @@
 #include "esp_crt_bundle.h"
 #include "mqtt_client.h"
 
+#include "esp_sntp.h"
+
 static const char *TAG = "mqtt_image";
 
 extern const uint8_t test_image_jpg_start[] asm("_binary_test_image_jpg_start");
@@ -29,17 +33,70 @@ static bool g_mqtt_connected = false;
 static bool g_publish_task_started = false;
 
 static const int T_SECONDS = 2;   // NIM 13522091 -> mod(91,10)+1 = 2
-static const int N_SEND    = 4;  // 10 / 20 / 100 eksperimen Level 1
+static const int N_SEND    = 4;   // 10 / 20 / 100 untuk eksperimen Level 1
 
 static const char *DEVICE_ID = "esp32-13522091";
-static const char *MODE      = "experiment"; // 'experiment' untuk level 1, 'event' untuk level 2
+static const char *MODE      = "experiment";   // experiment / event
 
 static char g_session_id[32];
 
+static int64_t get_epoch_time_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((int64_t)tv.tv_sec * 1000000LL) + (int64_t)tv.tv_usec;
+}
+
+static bool is_time_synchronized(void)
+{
+    time_t now;
+    time(&now);
+
+    struct tm timeinfo = {0};
+    localtime_r(&now, &timeinfo);
+
+    return (timeinfo.tm_year >= (2024 - 1900));
+}
+
+static void sync_time_with_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+
+    const int max_retry = 30;
+    int retry = 0;
+
+    while (!is_time_synchronized() && retry < max_retry) {
+        ESP_LOGI(TAG, "Waiting for SNTP time sync... (%d/%d)", retry + 1, max_retry);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+
+    if (!is_time_synchronized()) {
+        ESP_LOGE(TAG, "Failed to synchronize time with SNTP");
+        return;
+    }
+
+    time_t now;
+    time(&now);
+    struct tm timeinfo = {0};
+    localtime_r(&now, &timeinfo);
+
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+    ESP_LOGI(TAG, "SNTP time synchronized: %s", time_str);
+    ESP_LOGI(TAG, "Epoch time (us): %" PRId64, get_epoch_time_us());
+}
+
 static void build_session_id(char *buf, size_t len)
 {
-    int64_t boot_ts_us = esp_timer_get_time();
-    snprintf(buf, len, "sess-%" PRId64, boot_ts_us);
+    int64_t epoch_us = get_epoch_time_us();
+    snprintf(buf, len, "sess-%" PRId64, epoch_us);
 }
 
 static void build_experiment_id(char *buf, size_t len)
@@ -80,7 +137,7 @@ static void publish_image_once(esp_mqtt_client_handle_t client, int attempt_inde
     build_topic(meta_topic, sizeof(meta_topic), "meta");
     build_topic(raw_topic, sizeof(raw_topic), "raw");
 
-    int64_t ts_send_us = esp_timer_get_time();
+    int64_t ts_send_us = get_epoch_time_us();
 
     char experiment_id[64];
     build_experiment_id(experiment_id, sizeof(experiment_id));
@@ -110,6 +167,7 @@ static void publish_image_once(esp_mqtt_client_handle_t client, int attempt_inde
     ESP_LOGI(TAG, "SEND %d/%d", attempt_index, N_SEND);
     ESP_LOGI(TAG, "meta_topic    : %s", meta_topic);
     ESP_LOGI(TAG, "raw_topic     : %s", raw_topic);
+    ESP_LOGI(TAG, "timestamp_us  : %" PRId64, ts_send_us);
     ESP_LOGI(TAG, "metadata_json : %s", meta_payload);
     ESP_LOGI(TAG, "raw_size      : %u bytes", (unsigned int)image_size_bytes);
 
@@ -230,14 +288,21 @@ void app_main(void)
     ESP_LOGI(TAG, "T_SECONDS       : %d", T_SECONDS);
     ESP_LOGI(TAG, "N_SEND          : %d", N_SEND);
 
-    build_session_id(g_session_id, sizeof(g_session_id));
-    ESP_LOGI(TAG, "session_id      : %s", g_session_id);
-
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_ERROR_CHECK(example_connect());
+
+    sync_time_with_sntp();
+
+    if (!is_time_synchronized()) {
+        ESP_LOGE(TAG, "System time is invalid, abort publishing");
+        return;
+    }
+
+    build_session_id(g_session_id, sizeof(g_session_id));
+    ESP_LOGI(TAG, "session_id      : %s", g_session_id);
 
     mqtt_app_start();
 }
