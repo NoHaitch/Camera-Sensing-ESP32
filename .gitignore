@@ -40,3 +40,4 @@ mqttcred
 
 # python receiver
 .venv
+received_images
