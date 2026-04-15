@@ -12,7 +12,7 @@
   <strong>
     <h3>Made By:</h3>
     <h3>Raden Francisco Trianto B.</h3>
-    <h3>NIM 1352091</h3>
+    <h3>NIM 13522091</h3>
   </strong>
   <br>
 </div>
