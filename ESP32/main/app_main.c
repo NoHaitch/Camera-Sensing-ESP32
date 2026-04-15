@@ -33,7 +33,7 @@ static bool g_mqtt_connected = false;
 static bool g_publish_task_started = false;
 
 static const int T_SECONDS = 2;   // NIM 13522091 -> mod(91,10)+1 = 2
-static const int N_SEND    = 4;   // 10 / 20 / 100 untuk eksperimen Level 1
+static const int N_SEND    = 10;   // 10 / 20 / 100 untuk eksperimen Level 1
 
 static const char *DEVICE_ID = "esp32-13522091";
 static const char *MODE      = "experiment";   // experiment / event
