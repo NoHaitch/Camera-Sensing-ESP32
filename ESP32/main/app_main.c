@@ -47,13 +47,15 @@ static bool g_mqtt_connected = false;
 static bool g_publish_task_started = false;
 
 static const int T_SECONDS = 2;   // NIM 13522091 -> mod(91,10)+1 = 2
-static const int N_SEND = 10;   // 10 / 20 / 100 untuk eksperimen Leve
+static const int N_SEND    = 10;  // 10 / 20 / 100 untuk eksperimen Level 1
 
-static const int FRAME_DELAY_MS = 500;
+/* Random Frame Delay -- For constant, use same value */
+static const int FRAME_DELAY_MIN_MS = 250;  // shortest delay
+static const int FRAME_DELAY_MAX_MS = 750;  // longest delay
+
 static const int EVENT_COOLDOWN_MS = 5000;
-
-static const int BYTE_DIFF_STEP = 32;
-static const int BYTE_DIFF_THRESHOLD = 20;
+static const int BYTE_DIFF_STEP        = 32;
+static const int BYTE_DIFF_THRESHOLD   = 20;
 static const float MOTION_RATIO_THRESHOLD = 0.08f;
 
 static const char *DEVICE_ID = "esp32-13522091";
@@ -78,7 +80,8 @@ static const embedded_frame_t g_event_frames[] = {
     { frame_07_jpg_start, frame_07_jpg_end, "frame_07.jpg" },
 };
 
-static const size_t g_event_frame_count = sizeof(g_event_frames) / sizeof(g_event_frames[0]);
+static const size_t g_event_frame_count =
+    sizeof(g_event_frames) / sizeof(g_event_frames[0]);
 
 static int64_t get_epoch_time_us(void) {
     struct timeval tv;
@@ -89,6 +92,7 @@ static int64_t get_epoch_time_us(void) {
 static bool is_time_synchronized(void) {
     time_t now;
     time(&now);
+
     struct tm timeinfo = {0};
     localtime_r(&now, &timeinfo);
     return (timeinfo.tm_year >= (2024 - 1900));
@@ -145,6 +149,21 @@ static size_t get_image_size_bytes(const uint8_t *start, const uint8_t *end) {
     return (size_t)(end - start);
 }
 
+static int get_random_frame_delay_ms(void) {
+    int min_ms = FRAME_DELAY_MIN_MS;
+    int max_ms = FRAME_DELAY_MAX_MS;
+    if (min_ms < 0) min_ms = 0;
+    if (max_ms < min_ms) max_ms = min_ms;
+
+    int range = max_ms - min_ms;
+    if (range == 0) {
+        return min_ms;
+    }
+
+    int r = rand() % (range + 1);
+    return min_ms + r;
+}
+
 static void log_experiment_header(size_t image_size_bytes) {
     char experiment_id[64];
     build_experiment_id(experiment_id, sizeof(experiment_id));
@@ -169,7 +188,8 @@ static void log_event_header(void) {
     ESP_LOGI(TAG, "session_id             : %s", g_session_id);
     ESP_LOGI(TAG, "mode                   : %s", MODE);
     ESP_LOGI(TAG, "frame_count            : %u", (unsigned int)g_event_frame_count);
-    ESP_LOGI(TAG, "frame_delay_ms         : %d", FRAME_DELAY_MS);
+    ESP_LOGI(TAG, "frame_delay_min_ms     : %d", FRAME_DELAY_MIN_MS);
+    ESP_LOGI(TAG, "frame_delay_max_ms     : %d", FRAME_DELAY_MAX_MS);
     ESP_LOGI(TAG, "event_cooldown_ms      : %d", EVENT_COOLDOWN_MS);
     ESP_LOGI(TAG, "byte_diff_step         : %d", BYTE_DIFF_STEP);
     ESP_LOGI(TAG, "byte_diff_threshold    : %d", BYTE_DIFF_THRESHOLD);
@@ -223,7 +243,9 @@ static void publish_image_buffer(
     ESP_LOGI(TAG, "raw_size      : %u bytes", (unsigned int)image_size_bytes);
 
     int meta_msg_id = esp_mqtt_client_publish(client, meta_topic, meta_payload, 0, 1, 0);
-    int raw_msg_id  = esp_mqtt_client_publish(client, raw_topic, (const char *)image_data, (int)image_size_bytes, 1, 0);
+    int raw_msg_id  = esp_mqtt_client_publish(client, raw_topic,
+                                              (const char *)image_data,
+                                              (int)image_size_bytes, 1, 0);
 
     ESP_LOGI(TAG, "publish_meta_msg_id : %d", meta_msg_id);
     ESP_LOGI(TAG, "publish_raw_msg_id  : %d", raw_msg_id);
@@ -237,9 +259,11 @@ static void publish_level1_image_once(esp_mqtt_client_handle_t client, int attem
     char experiment_id[64];
     build_experiment_id(experiment_id, sizeof(experiment_id));
 
-    publish_image_buffer(client, image_data, image_size_bytes, attempt_index, N_SEND, experiment_id);
+    publish_image_buffer(client, image_data, image_size_bytes,
+                         attempt_index, N_SEND, experiment_id);
 }
 
+/* frame differencing */
 static float compute_frame_motion_score(
     const uint8_t *prev_data, size_t prev_size,
     const uint8_t *curr_data, size_t curr_size
@@ -274,13 +298,15 @@ static bool is_motion_detected(
     const uint8_t *curr_data, size_t curr_size,
     float *out_score
 ) {
-    float score = compute_frame_motion_score(prev_data, prev_size, curr_data, curr_size);
+    float score = compute_frame_motion_score(prev_data, prev_size,
+                                             curr_data, curr_size);
     if (out_score) {
         *out_score = score;
     }
     return (score >= MOTION_RATIO_THRESHOLD);
 }
 
+/* Level 1: experiment */
 static void run_experiment_mode(void) {
     const size_t image_size_bytes = get_image_size_bytes(frame_00_jpg_start, frame_00_jpg_end);
     log_experiment_header(image_size_bytes);
@@ -301,6 +327,7 @@ static void run_experiment_mode(void) {
     ESP_LOGI(TAG, "Experiment finished");
 }
 
+/* Level 2: event based */
 static void run_event_mode(void) {
     int frame_index = 0;
     int send_index = 1;
@@ -310,7 +337,8 @@ static void run_event_mode(void) {
     size_t prev_size = 0;
 
     char experiment_id[64];
-    snprintf(experiment_id, sizeof(experiment_id), "event-motion-cooldown-%dms", EVENT_COOLDOWN_MS);
+    snprintf(experiment_id, sizeof(experiment_id),
+             "event-motion-cooldown-%dms", EVENT_COOLDOWN_MS);
 
     log_event_header();
 
@@ -323,12 +351,15 @@ static void run_event_mode(void) {
         bool motion = false;
 
         if (has_prev_frame) {
-            motion = is_motion_detected(prev_data, prev_size, curr_data, curr_size, &motion_score);
+            motion = is_motion_detected(prev_data, prev_size,
+                                        curr_data, curr_size,
+                                        &motion_score);
         }
 
         int64_t now_us = get_epoch_time_us();
-        bool cooldown_ok = (last_event_us == 0) ||
-                           ((now_us - last_event_us) >= ((int64_t)EVENT_COOLDOWN_MS * 1000LL));
+        bool cooldown_ok =
+            (last_event_us == 0) ||
+            ((now_us - last_event_us) >= ((int64_t)EVENT_COOLDOWN_MS * 1000LL));
 
         ESP_LOGI(TAG,
                  "FRAME %d/%u | %s | size=%u | motion=%s | score=%.4f | cooldown_ok=%s",
@@ -342,12 +373,17 @@ static void run_event_mode(void) {
 
         if (has_prev_frame && motion && cooldown_ok) {
             ESP_LOGI(TAG, "EVENT TRIGGERED -> publish frame %s", frame->name);
-            publish_image_buffer(g_client, curr_data, curr_size, send_index++, 999999, experiment_id);
+            publish_image_buffer(g_client, curr_data, curr_size,
+                                 send_index++, 0, experiment_id);
             last_event_us = now_us;
+
         } else if (has_prev_frame && motion && !cooldown_ok) {
-            int64_t remain_ms = EVENT_COOLDOWN_MS - ((now_us - last_event_us) / 1000LL);
+            int64_t remain_ms =
+                EVENT_COOLDOWN_MS - ((now_us - last_event_us) / 1000LL);
             if (remain_ms < 0) remain_ms = 0;
-            ESP_LOGI(TAG, "MOTION DETECTED but cooldown active, remaining=%" PRId64 " ms", remain_ms);
+            ESP_LOGI(TAG,
+                     "MOTION DETECTED but cooldown active, remaining=%" PRId64 " ms",
+                     remain_ms);
         }
 
         prev_data = curr_data;
@@ -355,7 +391,10 @@ static void run_event_mode(void) {
         has_prev_frame = true;
 
         frame_index = (frame_index + 1) % g_event_frame_count;
-        vTaskDelay(pdMS_TO_TICKS(FRAME_DELAY_MS));
+
+        int delay_ms = get_random_frame_delay_ms();
+        ESP_LOGI(TAG, "Next frame in %d ms", delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 
     ESP_LOGI(TAG, "Event mode stopped");
@@ -374,7 +413,10 @@ static void image_publish_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     esp_mqtt_client_handle_t client = event->client;
 
@@ -386,7 +428,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         if (!g_publish_task_started) {
             g_publish_task_started = true;
-            xTaskCreate(image_publish_task, "image_publish_task", 8192, NULL, 5, NULL);
+            xTaskCreate(image_publish_task, "image_publish_task",
+                        8192, NULL, 5, NULL);
         }
         break;
 
@@ -421,25 +464,30 @@ static void mqtt_app_start(void) {
         },
     };
 
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_handle_t client =
+        esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID,
+                                   mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
 }
 
 void app_main(void) {
     ESP_LOGI(TAG, "Starting app");
-    ESP_LOGI(TAG, "ESP-IDF version : %s", esp_get_idf_version());
-    ESP_LOGI(TAG, "T_SECONDS       : %d", T_SECONDS);
-    ESP_LOGI(TAG, "N_SEND          : %d", N_SEND);
-    ESP_LOGI(TAG, "FRAME_DELAY_MS  : %d", FRAME_DELAY_MS);
-    ESP_LOGI(TAG, "EVENT_COOLDOWN_MS : %d", EVENT_COOLDOWN_MS);
-    ESP_LOGI(TAG, "MODE            : %s", MODE);
+    ESP_LOGI(TAG, "ESP-IDF version       : %s", esp_get_idf_version());
+    ESP_LOGI(TAG, "T_SECONDS             : %d", T_SECONDS);
+    ESP_LOGI(TAG, "N_SEND                : %d", N_SEND);
+    ESP_LOGI(TAG, "FRAME_DELAY_MIN_MS    : %d", FRAME_DELAY_MIN_MS);
+    ESP_LOGI(TAG, "FRAME_DELAY_MAX_MS    : %d", FRAME_DELAY_MAX_MS);
+    ESP_LOGI(TAG, "EVENT_COOLDOWN_MS     : %d", EVENT_COOLDOWN_MS);
+    ESP_LOGI(TAG, "MODE                  : %s", MODE);
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_ERROR_CHECK(example_connect());
+
+    srand((unsigned int)(get_epoch_time_us() & 0xFFFFFFFFULL));
 
     sync_time_with_sntp();
 
@@ -449,7 +497,7 @@ void app_main(void) {
     }
 
     build_session_id(g_session_id, sizeof(g_session_id));
-    ESP_LOGI(TAG, "session_id      : %s", g_session_id);
+    ESP_LOGI(TAG, "session_id            : %s", g_session_id);
 
     mqtt_app_start();
 }
